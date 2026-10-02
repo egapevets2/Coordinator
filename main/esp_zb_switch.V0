@@ -1,0 +1,1515 @@
+
+
+#include "string.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "esp_err.h"
+#include "esp_check.h"
+#include "esp_log.h"
+#include "nvs_flash.h"
+#include "esp_system.h"
+#include "ha/esp_zigbee_ha_standard.h"
+#include "zcl_utility.h"
+#include "esp_zb_switch.h"
+#include "aps/esp_zigbee_aps.h"
+#include <stdbool.h>
+#include <stdint.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#if defined ZB_ED_ROLE
+#error Define ZB_COORDINATOR_ROLE in idf.py menuconfig to compile light switch source code.
+#endif
+
+// -----------------------------------------------------------------------------
+// Explicit serial backend for the human-readable mesh console.
+// This avoids getchar()/VFS console ambiguity.
+//
+// Set MESH_SERIAL_USE_USB_SERIAL_JTAG to 1 for the ESP32-C6 USB Serial/JTAG port.
+// Later, set it to 0 to use hardware UART RX/TX pins for the downstream system.
+// -----------------------------------------------------------------------------
+#define MESH_SERIAL_USE_USB_SERIAL_JTAG 1
+
+#if MESH_SERIAL_USE_USB_SERIAL_JTAG
+#include "driver/usb_serial_jtag.h"
+#else
+#include "driver/uart.h"
+#include "driver/gpio.h"
+#endif
+#include <stdarg.h>
+
+#if !MESH_SERIAL_USE_USB_SERIAL_JTAG
+#define MESH_UART_NUM UART_NUM_1
+#define MESH_UART_TX_GPIO GPIO_NUM_17
+#define MESH_UART_RX_GPIO GPIO_NUM_16
+#define MESH_UART_BAUD 115200
+#endif
+
+static esp_err_t mesh_serial_init(void)
+{
+#if MESH_SERIAL_USE_USB_SERIAL_JTAG
+    usb_serial_jtag_driver_config_t cfg = {
+        .tx_buffer_size = 1024,
+        .rx_buffer_size = 1024,
+    };
+    return usb_serial_jtag_driver_install(&cfg);
+#else
+    uart_config_t cfg = {
+        .baud_rate = MESH_UART_BAUD,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+
+    ESP_ERROR_CHECK(uart_driver_install(MESH_UART_NUM, 1024, 1024, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_param_config(MESH_UART_NUM, &cfg));
+    ESP_ERROR_CHECK(uart_set_pin(MESH_UART_NUM,
+                                 MESH_UART_TX_GPIO,
+                                 MESH_UART_RX_GPIO,
+                                 UART_PIN_NO_CHANGE,
+                                 UART_PIN_NO_CHANGE));
+    return ESP_OK;
+#endif
+}
+
+static int mesh_serial_read_byte(void)
+{
+    uint8_t ch = 0;
+#if MESH_SERIAL_USE_USB_SERIAL_JTAG
+    int n = usb_serial_jtag_read_bytes(&ch, 1, pdMS_TO_TICKS(10));
+#else
+    int n = uart_read_bytes(MESH_UART_NUM, &ch, 1, pdMS_TO_TICKS(10));
+#endif
+    return (n == 1) ? (int)ch : -1;
+}
+
+static void mesh_serial_write(const char *s)
+{
+    if (!s)
+    {
+        return;
+    }
+#if MESH_SERIAL_USE_USB_SERIAL_JTAG
+    usb_serial_jtag_write_bytes((const uint8_t *)s, strlen(s), pdMS_TO_TICKS(100));
+#else
+    uart_write_bytes(MESH_UART_NUM, s, strlen(s));
+#endif
+}
+
+static void mesh_serial_writef(const char *fmt, ...)
+{
+    char buf[160];
+
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+
+    mesh_serial_write(buf);
+}
+
+static const char *TAG = "ESP_ZB_ON_OFF_SWITCH";
+
+#define MESH_TEXT_LEN 18
+#define MESH_LINE_LEN 80
+
+typedef struct
+{
+    char source[MESH_TEXT_LEN]; // "Kitchen", "Garage", or "" if not relevant
+    char target[MESH_TEXT_LEN]; // "Kitchen", "Garage", or "" if not relevant
+    char cmd[MESH_TEXT_LEN];    // "blink", "button", "prox", "pwm", etc.
+    int16_t value;              // optional numeric value
+    char text[MESH_LINE_LEN];   // optional full text line for the serial bridge
+} mesh_msg_t;
+
+static bool send_command_by_name(const char *name, const char *cmd, int16_t value);
+static bool send_text_by_name(const char *name, const char *text);
+static void send_aps_string_to_device(uint16_t short_addr, uint8_t endpoint, const char *msg);
+static void print_network_report(void);
+static void ping_network(void);
+static void start_fresh_network_report(void);
+static void fresh_network_report_task(void *arg);
+static void discover_known_devices_start(void);
+static void discover_known_devices_pass_alarm_cb(uint8_t pass);
+static void reset_network_discovery(void);
+static void reset_coordinator(void);
+
+#define MESH_RX_QUEUE_LEN 16
+#define MESH_TX_QUEUE_LEN 16
+
+static QueueHandle_t g_mesh_rx_queue = NULL;
+static QueueHandle_t g_mesh_tx_queue = NULL;
+
+#define FRESH_NETWORK_REPORT_TIMEOUT_MS 3000
+static volatile bool g_fresh_report_active = false;
+static volatile int g_fresh_report_expected = 0;
+static volatile int g_fresh_report_received = 0;
+
+static esp_err_t mesh_init_queues(void)
+{
+    if (!g_mesh_rx_queue)
+    {
+        g_mesh_rx_queue = xQueueCreate(MESH_RX_QUEUE_LEN, sizeof(mesh_msg_t));
+    }
+    if (!g_mesh_tx_queue)
+    {
+        g_mesh_tx_queue = xQueueCreate(MESH_TX_QUEUE_LEN, sizeof(mesh_msg_t));
+    }
+
+    ESP_RETURN_ON_FALSE(g_mesh_rx_queue && g_mesh_tx_queue, ESP_FAIL, TAG, "Failed to create mesh queues");
+    return ESP_OK;
+}
+
+bool enqueue_outgoing(mesh_msg_t msg)
+{
+    if (!g_mesh_tx_queue)
+    {
+        ESP_LOGW(TAG, "TX queue not initialized");
+        return false;
+    }
+    return xQueueSend(g_mesh_tx_queue, &msg, 0) == pdTRUE;
+}
+
+bool dequeue_incoming(mesh_msg_t *msg, TickType_t timeout)
+{
+    if (!g_mesh_rx_queue || !msg)
+    {
+        return false;
+    }
+    return xQueueReceive(g_mesh_rx_queue, msg, timeout) == pdTRUE;
+}
+
+static bool enqueue_incoming_from_zigbee(mesh_msg_t msg)
+{
+    if (!g_mesh_rx_queue)
+    {
+        ESP_LOGW(TAG, "RX queue not initialized");
+        return false;
+    }
+    return xQueueSend(g_mesh_rx_queue, &msg, 0) == pdTRUE;
+}
+
+static void strip_line_endings(char *s)
+{
+    if (!s)
+    {
+        return;
+    }
+
+    size_t len = strlen(s);
+    while (len > 0 && (s[len - 1] == '\r' || s[len - 1] == '\n'))
+    {
+        s[len - 1] = '\0';
+        len--;
+    }
+}
+
+static bool aps_payload_looks_like_text(const uint8_t *data, size_t len)
+{
+    if (!data || len == 0)
+    {
+        return false;
+    }
+
+    // Plain serial-bridge messages start with printable ASCII.
+    // Packed AppMessage starts with int16_t value; our current values are small
+    // binary numbers such as 1, 3, and 5.
+    return (data[0] >= 0x20 && data[0] <= 0x7e);
+}
+
+static void parse_console_line_to_mesh_msg(const char *line, mesh_msg_t *msg)
+{
+    if (!line || !msg)
+    {
+        return;
+    }
+
+    memset(msg, 0, sizeof(*msg));
+    strncpy(msg->text, line, sizeof(msg->text) - 1);
+
+    char target[MESH_TEXT_LEN] = {0};
+    char cmd[MESH_TEXT_LEN] = {0};
+    int value = 0;
+
+    int fields = sscanf(line, "%17s %17s %d", target, cmd, &value);
+    if (fields >= 1)
+    {
+        strncpy(msg->target, target, sizeof(msg->target) - 1);
+    }
+    if (fields >= 2)
+    {
+        strncpy(msg->cmd, cmd, sizeof(msg->cmd) - 1);
+    }
+    if (fields >= 3)
+    {
+        msg->value = (int16_t)value;
+    }
+}
+
+static void serial_console_task(void *arg)
+{
+    char line[MESH_LINE_LEN] = {0};
+    size_t pos = 0;
+
+    ESP_LOGI(TAG, "Serial command interface ready: <target> <cmd> [value]");
+    mesh_serial_write("\r\nSerial ready. Use: Kitchen blink 3\r\n");
+
+    while (1)
+    {
+        int ch = mesh_serial_read_byte();
+        if (ch < 0)
+        {
+            continue;
+        }
+
+        if (ch == '\r' || ch == '\n')
+        {
+            if (pos == 0)
+            {
+                continue;
+            }
+
+            line[pos] = '\0';
+            strip_line_endings(line);
+            mesh_serial_writef("\r\n> %s\r\n", line);
+
+            if (strcmp(line, "GiveNetworkReport") == 0)
+            {
+                start_fresh_network_report();
+                pos = 0;
+                memset(line, 0, sizeof(line));
+                continue;
+            }
+
+            if (strcmp(line, "PingNetwork") == 0)
+            {
+                ping_network();
+                pos = 0;
+                memset(line, 0, sizeof(line));
+                continue;
+            }
+
+            if (strcmp(line, "ResetNetwork") == 0)
+            {
+                reset_network_discovery();
+                pos = 0;
+                memset(line, 0, sizeof(line));
+                continue;
+            }
+
+            if (strcmp(line, "ResetCoordinator") == 0)
+            {
+                reset_coordinator();
+                pos = 0;
+                memset(line, 0, sizeof(line));
+                continue;
+            }
+
+            mesh_msg_t msg = {0};
+            parse_console_line_to_mesh_msg(line, &msg);
+
+            if (msg.target[0] == '\0')
+            {
+                mesh_serial_write("error: missing target\r\n");
+                ESP_LOGW(TAG, "Serial line ignored: missing target");
+            }
+            else if (!enqueue_outgoing(msg))
+            {
+                mesh_serial_write("error: TX queue full\r\n");
+                ESP_LOGW(TAG, "TX queue full, dropping serial line: %s", line);
+            }
+            else
+            {
+                mesh_serial_write("queued\r\n");
+                ESP_LOGI(TAG, "SERIAL TX queued: %s", line);
+            }
+
+            pos = 0;
+            memset(line, 0, sizeof(line));
+        }
+        else if (ch == 8 || ch == 127)
+        {
+            if (pos > 0)
+            {
+                pos--;
+                line[pos] = '\0';
+                mesh_serial_write("\b \b");
+            }
+        }
+        else if (pos < sizeof(line) - 1)
+        {
+            line[pos++] = (char)ch;
+            char echo[2] = {(char)ch, 0};
+            mesh_serial_write(echo);
+        }
+        else
+        {
+            mesh_serial_write("\r\nerror: line too long\r\n");
+            ESP_LOGW(TAG, "Serial line too long, clearing buffer");
+            pos = 0;
+            memset(line, 0, sizeof(line));
+        }
+    }
+}
+
+static void mesh_tx_task(void *arg)
+{
+    mesh_msg_t msg;
+
+    while (1)
+    {
+        if (xQueueReceive(g_mesh_tx_queue, &msg, portMAX_DELAY) == pdTRUE)
+        {
+            if (msg.target[0] == '\0')
+            {
+                ESP_LOGW(TAG, "Dropping TX with empty target");
+                continue;
+            }
+
+            if (msg.text[0] != '\0')
+            {
+                if (!send_text_by_name(msg.target, msg.text))
+                {
+                    ESP_LOGW(TAG, "Failed to send text to '%s': %s", msg.target, msg.text);
+                }
+            }
+            else if (!send_command_by_name(msg.target, msg.cmd, msg.value))
+            {
+                ESP_LOGW(TAG, "Failed to send cmd='%s' to '%s'", msg.cmd, msg.target);
+            }
+        }
+    }
+}
+
+static void app_msg_task(void *arg)
+{
+    mesh_msg_t msg;
+
+    while (1)
+    {
+        if (dequeue_incoming(&msg, portMAX_DELAY))
+        {
+            if (msg.text[0] != '\0')
+            {
+                ESP_LOGI(TAG, "SERIAL RX from %s: %s", msg.source, msg.text);
+                if (strcmp(msg.text, "ACK") == 0)
+                {
+                    mesh_serial_writef("< %s: [ACK]\r\n", msg.source);
+                }
+                else if (strncmp(msg.text, "PONG", 4) == 0)
+                {
+                    int remote_lqi = -1;
+                    char *p = strstr(msg.text, "LQI=");
+                    if (p)
+                    {
+                        remote_lqi = atoi(p + 4);
+                    }
+
+                    mesh_serial_writef("< %s: [PONG LQI=%d REMOTE_LQI=%d]\r\n",
+                                       msg.source,
+                                       msg.value,
+                                       remote_lqi);
+                    ESP_LOGI(TAG, "PingNetwork: PONG received from %s local_lqi=%d remote_lqi=%d",
+                             msg.source,
+                             msg.value,
+                             remote_lqi);
+
+                    if (g_fresh_report_active)
+                    {
+                        g_fresh_report_received++;
+                    }
+                }
+                else
+                {
+                    mesh_serial_writef("< %s: %s\r\n", msg.source, msg.text);
+                }
+
+                // Application ACK: confirm receipt of non-ACK text messages.
+
+                if (strcmp(msg.text, "ACK") != 0 &&
+                    strncmp(msg.text, "PONG", 4) != 0 &&
+                    msg.source[0] != '\0')
+                {
+                    mesh_msg_t ack = {0};
+                    strncpy(ack.target, msg.source, sizeof(ack.target) - 1);
+                    strncpy(ack.text, "ACK", sizeof(ack.text) - 1);
+                    enqueue_outgoing(ack);
+                }
+            }
+            else if (strcmp(msg.cmd, "button") == 0)
+            {
+                ESP_LOGI(TAG, "%s Button Pressed", msg.source);
+                mesh_serial_writef("< %s: button %d\r\n", msg.source, msg.value);
+            }
+            else
+            {
+                ESP_LOGI(TAG, "APP RX source='%s' cmd='%s' value=%d",
+                         msg.source, msg.cmd, msg.value);
+                mesh_serial_writef("< %s: %s %d\r\n", msg.source, msg.cmd, msg.value);
+            }
+        }
+    }
+}
+
+//-------------------------------------------------------------------------------
+//                                              ZIGBEE TO BE A SEPERATE FILE
+//-------------------------------------------------------------------------------
+typedef struct light_bulb_device_params_s
+{
+    esp_zb_ieee_addr_t ieee_addr;
+    uint8_t endpoint;
+    uint16_t short_addr;
+} light_bulb_device_params_t;
+
+static switch_func_pair_t button_func_pair[] = {
+    {GPIO_INPUT_IO_TOGGLE_SWITCH, SWITCH_ONOFF_TOGGLE_CONTROL}};
+
+#define APS_MSG_CLUSTER_ID 0xFFC0
+#define APS_MSG_MAX_LEN MESH_LINE_LEN
+
+static uint16_t g_last_light_short_addr = 0xFFFF;
+static uint8_t g_last_light_endpoint = 0xFF;
+
+//-====----------------------------------------------
+//                                         M e s s a g e
+//                                         C o d e
+#define CMD_LEN 18
+
+typedef struct __attribute__((packed))
+{
+    int16_t value;
+    char cmd[CMD_LEN];
+} AppMessage;
+
+typedef struct
+{
+    uint64_t ieee;
+    const char *name;
+    uint16_t short_addr;
+    uint8_t endpoint;
+    bool online;
+    int16_t last_lqi;
+    int16_t remote_lqi;
+    TickType_t last_seen_tick;
+    bool fresh_ping_expected;
+    bool fresh_ping_seen;
+} DeviceEntry;
+
+static DeviceEntry devices[] = {
+    {0xb43a45fffe8ac640ULL, "Kitchen", 0xFFFF, 10, false, 0, -1, 0, false, false},
+    {0xb43a45fffe8ac7c0ULL, "Garage", 0xFFFF, 10, false, 0, -1, 0, false, false},
+    {0x58e6c5fffe1ae8a0ULL, "Santafe", 0xFFFF, 10, false, 0, -1, 0, false, false},
+    {0x58e6c5fffe1addd0ULL, "aa", 0xFFFF, 10, false, 0, -1, 0, false, false},
+     {0x58e6c5fffe136eecULL, "bb", 0xFFFF, 10, false, 0, -1, 0, false, false},
+   {0x00124B0001CCCCCCULL, "Boiler", 0xFFFF, 10, false, 0, -1, 0, false, false},
+};
+#define DEVICE_COUNT (sizeof(devices) / sizeof(devices[0]))
+
+static uint32_t device_age_seconds(const DeviceEntry *dev)
+{
+    if (!dev || dev->last_seen_tick == 0)
+    {
+        return 0;
+    }
+
+    TickType_t now = xTaskGetTickCount();
+    return (uint32_t)((now - dev->last_seen_tick) / configTICK_RATE_HZ);
+}
+
+static const char *device_type_string(const DeviceEntry *dev)
+{
+    return (dev && dev->online) ? "END_DEVICE" : "UNKNOWN";
+}
+
+static const char *device_route_string(const DeviceEntry *dev)
+{
+    return (dev && dev->online && dev->short_addr != 0xFFFF) ? "YES" : "NO";
+}
+
+static const char *device_rf_status_string(const DeviceEntry *dev)
+{
+    if (!dev || !dev->online || dev->short_addr == 0xFFFF)
+    {
+        return "UNKNOWN";
+    }
+
+    // Use the weaker of the two available directions.
+    // local LQI  = coordinator hears device
+    // remote LQI = device hears coordinator; -1 means not reported yet
+    int weakest_lqi = dev->last_lqi;
+    if (dev->remote_lqi >= 0 && dev->remote_lqi < weakest_lqi)
+    {
+        weakest_lqi = dev->remote_lqi;
+    }
+
+    if (weakest_lqi < 50)
+    {
+        return "WEAK";
+    }
+    if (weakest_lqi < 100)
+    {
+        return "MARGINAL";
+    }
+    return "OK";
+}
+
+static void print_network_report(void)
+{
+    mesh_serial_write("\r\n..... recieved GiveNetworkReport --------\r\n\r\n");
+    mesh_serial_write("*********************NETWORK_REPORT_BEGIN\r\n\r\n");
+    mesh_serial_write("NAME,IEEE,SHORT,ONLINE,TYPE,LQI,REMOTE_LQI,RF_STATUS,AGE,ROUTE\r\n");
+
+    uint32_t now = xTaskGetTickCount();
+
+    for (size_t i = 0; i < DEVICE_COUNT; i++)
+    {
+        DeviceEntry *dev = &devices[i];
+
+        uint32_t age_sec = 0;
+        if (dev->last_seen_tick != 0)
+        {
+            age_sec = (now - dev->last_seen_tick) / configTICK_RATE_HZ;
+        }
+
+        const char *type = dev->online ? "END_DEVICE" : "UNKNOWN";
+        const char *route = device_route_string(dev);
+        const char *rf_status = device_rf_status_string(dev);
+
+        char remote_lqi_str[8];
+        if (dev->remote_lqi >= 0)
+        {
+            snprintf(remote_lqi_str, sizeof(remote_lqi_str), "%d", dev->remote_lqi);
+        }
+        else
+        {
+            snprintf(remote_lqi_str, sizeof(remote_lqi_str), "-");
+        }
+
+        mesh_serial_writef(
+            "%s,0x%016llX,0x%04X,%d,%s,%d,%s,%s,%lu,%s\r\n",
+            dev->name,
+            (unsigned long long)dev->ieee,
+            dev->short_addr,
+            dev->online ? 1 : 0,
+            type,
+            dev->last_lqi,
+            remote_lqi_str,
+            rf_status,
+            (unsigned long)age_sec,
+            route);
+    }
+
+    mesh_serial_write("*********************NETWORK_REPORT_END\r\n\r\n");
+    mesh_serial_write("      ----------------------\r\n");
+    mesh_serial_write("      |   RF_STATUS_LEGEND  |\r\n");
+    mesh_serial_write("      ----------------------\r\n");
+
+    mesh_serial_write("MIN_LQI,MAX_LQI,RF_STATUS\r\n");
+    mesh_serial_write("0,49,WEAK\r\n");
+    mesh_serial_write("50,99,MARGINAL\r\n");
+    mesh_serial_write("100,255,OK\r\n");
+    mesh_serial_write("offline,offline,UNKNOWN\r\n\r\n");
+    mesh_serial_write("RF_STATUS_LEGEND_END\r\n");
+}
+
+static void ping_network(void)
+{
+    mesh_serial_write("PING_NETWORK_BEGIN\r\n");
+
+    for (size_t i = 0; i < DEVICE_COUNT; i++)
+    {
+        DeviceEntry *dev = &devices[i];
+
+        if (!dev->online || dev->short_addr == 0xFFFF)
+        {
+            mesh_serial_writef("PING %s SKIP ONLINE=%d SHORT=0x%04X\r\n",
+                               dev->name,
+                               dev->online ? 1 : 0,
+                               dev->short_addr);
+            continue;
+        }
+
+        mesh_msg_t msg = {0};
+        strncpy(msg.target, dev->name, sizeof(msg.target) - 1);
+        strncpy(msg.text, "PING", sizeof(msg.text) - 1);
+
+        if (enqueue_outgoing(msg))
+        {
+            mesh_serial_writef("PING %s SENT SHORT=0x%04X\r\n", dev->name, dev->short_addr);
+            ESP_LOGI(TAG, "PingNetwork: queued PING to %s short=0x%04x", dev->name, dev->short_addr);
+        }
+        else
+        {
+            mesh_serial_writef("PING %s ERROR=TX_QUEUE_FULL\r\n", dev->name);
+            ESP_LOGW(TAG, "PingNetwork: TX queue full for %s", dev->name);
+        }
+    }
+
+    mesh_serial_write("PING_NETWORK_END\r\n");
+}
+
+static void fresh_network_report_task(void *arg)
+{
+    TickType_t start_tick = xTaskGetTickCount();
+    TickType_t timeout_ticks = pdMS_TO_TICKS(FRESH_NETWORK_REPORT_TIMEOUT_MS);
+
+    while ((xTaskGetTickCount() - start_tick) < timeout_ticks)
+    {
+        if (g_fresh_report_expected <= 0 ||
+            g_fresh_report_received >= g_fresh_report_expected)
+        {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    mesh_serial_writef("FRESH_REPORT_RESPONSES RECEIVED=%d EXPECTED=%d\r\n",
+                       g_fresh_report_received,
+                       g_fresh_report_expected);
+
+    for (size_t i = 0; i < DEVICE_COUNT; i++)
+    {
+        DeviceEntry *dev = &devices[i];
+        if (dev->fresh_ping_expected && !dev->fresh_ping_seen)
+        {
+            dev->online = false;
+            dev->last_lqi = 0;
+            dev->remote_lqi = -1;
+            ESP_LOGW(TAG, "Fresh report: no PONG from %s, marking offline", dev->name);
+        }
+        dev->fresh_ping_expected = false;
+        dev->fresh_ping_seen = false;
+    }
+
+    print_network_report();
+
+    g_fresh_report_active = false;
+    vTaskDelete(NULL);
+}
+
+static void start_fresh_network_report(void)
+{
+    if (g_fresh_report_active)
+    {
+        mesh_serial_write("error: fresh network report already running\r\n");
+        return;
+    }
+
+    int expected = 0;
+    for (size_t i = 0; i < DEVICE_COUNT; i++)
+    {
+        DeviceEntry *dev = &devices[i];
+        dev->fresh_ping_expected = false;
+        dev->fresh_ping_seen = false;
+
+        if (dev->online && dev->short_addr != 0xFFFF)
+        {
+            expected++;
+            dev->fresh_ping_expected = true;
+            // Mark fresh-report RF values unknown until this fresh ping returns.
+            dev->last_lqi = 0;
+            dev->remote_lqi = -1;
+        }
+    }
+
+    g_fresh_report_expected = expected;
+    g_fresh_report_received = 0;
+    g_fresh_report_active = true;
+
+    mesh_serial_write("FRESH_NETWORK_REPORT_BEGIN\r\n");
+    ping_network();
+
+    if (expected == 0)
+    {
+        mesh_serial_write("FRESH_REPORT_RESPONSES RECEIVED=0 EXPECTED=0\r\n");
+        print_network_report();
+        g_fresh_report_active = false;
+        return;
+    }
+
+    if (xTaskCreate(fresh_network_report_task,
+                    "fresh_report_task",
+                    3072,
+                    NULL,
+                    4,
+                    NULL) != pdPASS)
+    {
+        mesh_serial_write("error: failed to start fresh report task\r\n");
+        g_fresh_report_active = false;
+    }
+}
+
+static void reset_network_discovery(void)
+{
+    mesh_serial_write("RESET_NETWORK_BEGIN\r\n");
+
+    // Keep the stable identity table (name + IEEE + last known short), but clear
+    // runtime reachability/RF state so discovery can rebuild current truth.
+    for (size_t i = 0; i < DEVICE_COUNT; i++)
+    {
+        DeviceEntry *dev = &devices[i];
+
+        dev->online = false;
+        dev->last_lqi = 0;
+        dev->remote_lqi = -1;
+        dev->last_seen_tick = 0;
+        dev->fresh_ping_expected = false;
+        dev->fresh_ping_seen = false;
+
+        // Keep dev->short_addr as last-known for diagnostics. A later discovery
+        // pass or device announcement will refresh it if the node is present.
+    }
+
+    // Permit late devices to rejoin while we actively rediscover known IEEE addresses.
+    esp_zb_bdb_open_network(180);
+    discover_known_devices_start();
+
+    mesh_serial_write("RESET_NETWORK_END\r\n");
+}
+
+static void reset_coordinator(void)
+{
+    mesh_serial_write("RESET_COORDINATOR_BEGIN\r\n");
+    mesh_serial_write("RESET_COORDINATOR_RESTARTING\r\n");
+    vTaskDelay(pdMS_TO_TICKS(200));
+    esp_restart();
+}
+
+static DeviceEntry *find_device_by_name(const char *name)
+{
+    for (size_t i = 0; i < DEVICE_COUNT; i++)
+    {
+        if (strcmp(devices[i].name, name) == 0)
+        {
+            return &devices[i];
+        }
+    }
+    return NULL;
+}
+
+static DeviceEntry *find_device_by_ieee(uint64_t ieee)
+{
+    for (size_t i = 0; i < DEVICE_COUNT; i++)
+    {
+        if (devices[i].ieee == ieee)
+        {
+            return &devices[i];
+        }
+    }
+    return NULL;
+}
+
+static uint64_t ieee_array_to_u64(const esp_zb_ieee_addr_t ieee_addr)
+{
+    uint64_t value = 0;
+    for (int i = 0; i < 8; i++)
+    {
+        value = (value << 8) | ieee_addr[7 - i];
+    }
+    return value;
+}
+
+static void u64_to_ieee_array(uint64_t ieee, esp_zb_ieee_addr_t ieee_addr)
+{
+    // esp_zb_ieee_addr_t is little-endian byte order in Espressif examples:
+    // display/constant 0xb43a45fffe8ac640 becomes bytes [40 c6 8a fe ff 45 3a b4].
+    for (int i = 0; i < 8; i++)
+    {
+        ieee_addr[i] = (uint8_t)((ieee >> (8 * i)) & 0xFF);
+    }
+}
+static void update_device_table(const esp_zb_ieee_addr_t ieee_addr,
+                                uint16_t short_addr,
+                                uint8_t endpoint)
+{
+    uint64_t ieee_u64 = ieee_array_to_u64(ieee_addr);
+    DeviceEntry *dev = find_device_by_ieee(ieee_u64);
+
+    if (dev)
+    {
+        dev->short_addr = short_addr;
+        dev->endpoint = endpoint;
+        dev->online = true;
+        dev->last_seen_tick = xTaskGetTickCount();
+
+        ESP_LOGI(TAG,
+                 "Device matched: name=%s ieee=0x%016llx short=0x%04x endpoint=%d online=%d",
+                 dev->name,
+                 (unsigned long long)dev->ieee,
+                 dev->short_addr,
+                 dev->endpoint,
+                 dev->online);
+    }
+    else
+    {
+        ESP_LOGW(TAG,
+                 "Unknown device joined: ieee=0x%016llx short=0x%04x endpoint=%d",
+                 (unsigned long long)ieee_u64,
+                 short_addr,
+                 endpoint);
+    }
+}
+
+static void send_aps_command_to_device(uint16_t short_addr, uint8_t endpoint,
+                                       const char *cmd, int16_t value)
+{
+    static AppMessage msg;
+
+    memset(&msg, 0, sizeof(msg));
+    msg.value = value;
+    strncpy(msg.cmd, cmd, CMD_LEN - 1);
+    msg.cmd[CMD_LEN - 1] = '\0';
+
+    esp_zb_apsde_data_req_t req = {
+        .dst_addr_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+        .dst_addr.addr_short = short_addr,
+        .dst_endpoint = endpoint,
+        .src_endpoint = HA_ONOFF_SWITCH_ENDPOINT,
+        .profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+        .cluster_id = APS_MSG_CLUSTER_ID,
+        .tx_options = ESP_ZB_APSDE_TX_OPT_ACK_TX,
+        .radius = 10,
+        .asdu_length = sizeof(msg),
+        .asdu = (uint8_t *)&msg,
+    };
+
+    esp_zb_lock_acquire(portMAX_DELAY);
+    esp_err_t ret = esp_zb_aps_data_request(&req);
+    esp_zb_lock_release();
+
+    ESP_LOGI(TAG, "APS command send returned: %d", ret);
+}
+
+static bool send_command_by_name(const char *name, const char *cmd, int16_t value)
+{
+    DeviceEntry *dev = find_device_by_name(name);
+
+    if (!dev)
+    {
+        ESP_LOGW(TAG, "Unknown device name: %s", name);
+        return false;
+    }
+
+    if (!dev->online || dev->short_addr == 0xFFFF)
+    {
+        ESP_LOGW(TAG, "Device offline: %s", name);
+        return false;
+    }
+
+    ESP_LOGI(TAG,
+             "Sending command to %s: short=0x%04x endpoint=%d cmd=%s value=%d",
+             dev->name,
+             dev->short_addr,
+             dev->endpoint,
+             cmd,
+             value);
+
+    send_aps_command_to_device(dev->short_addr, dev->endpoint, cmd, value);
+    return true;
+}
+
+static bool send_text_by_name(const char *name, const char *text)
+{
+    DeviceEntry *dev = find_device_by_name(name);
+
+    if (!dev)
+    {
+        ESP_LOGW(TAG, "Unknown device name: %s", name);
+        return false;
+    }
+
+    if (!dev->online || dev->short_addr == 0xFFFF)
+    {
+        ESP_LOGW(TAG, "Device offline: %s", name);
+        return false;
+    }
+
+    ESP_LOGI(TAG,
+             "Sending text to %s: short=0x%04x endpoint=%d text='%s'",
+             dev->name,
+             dev->short_addr,
+             dev->endpoint,
+             text);
+
+    send_aps_string_to_device(dev->short_addr, dev->endpoint, text);
+    return true;
+}
+
+//-====----------------------------------------------
+static void send_aps_string_to_device(uint16_t short_addr, uint8_t endpoint, const char *msg)
+{
+    uint16_t len = strlen(msg) + 1;
+
+    esp_zb_apsde_data_req_t req = {
+        .dst_addr_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+        .dst_addr.addr_short = short_addr,
+        .dst_endpoint = endpoint,
+        .src_endpoint = HA_ONOFF_SWITCH_ENDPOINT,
+        .profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+        .cluster_id = APS_MSG_CLUSTER_ID,
+        .tx_options = ESP_ZB_APSDE_TX_OPT_ACK_TX,
+        .radius = 10,
+        .asdu_length = len,
+        .asdu = (uint8_t *)msg,
+    };
+
+    esp_zb_lock_acquire(portMAX_DELAY);
+    esp_err_t ret = esp_zb_aps_data_request(&req);
+    esp_zb_lock_release();
+
+    ESP_LOGI(TAG, "APS send returned: %d", ret);
+}
+
+static void zb_apsde_data_confirm_handler(esp_zb_apsde_data_confirm_t confirm)
+{
+    if (confirm.status == 0x00)
+    {
+        ESP_LOGI(TAG, "APS TX OK to 0x%04hx ep %d",
+                 confirm.dst_addr.addr_short,
+                 confirm.dst_endpoint);
+    }
+    else
+    {
+        ESP_LOGE(TAG, "APS TX FAIL status=%d", confirm.status);
+    }
+}
+
+static DeviceEntry *find_device_by_short(uint16_t short_addr)
+{
+    for (size_t i = 0; i < DEVICE_COUNT; i++)
+    {
+        if (devices[i].short_addr == short_addr)
+        {
+            return &devices[i];
+        }
+    }
+    return NULL;
+}
+
+static bool zb_apsde_data_indication_handler(esp_zb_apsde_data_ind_t ind)
+{
+    if (ind.status == 0x00 &&
+        ind.dst_endpoint == HA_ONOFF_SWITCH_ENDPOINT &&
+        ind.profile_id == ESP_ZB_AF_HA_PROFILE_ID &&
+        ind.cluster_id == APS_MSG_CLUSTER_ID)
+    {
+
+        // ===== CASE 1: structured message =====
+        if (ind.asdu_length == sizeof(AppMessage) &&
+            !aps_payload_looks_like_text((const uint8_t *)ind.asdu, ind.asdu_length))
+        {
+            AppMessage *msg = (AppMessage *)ind.asdu;
+
+            DeviceEntry *dev = find_device_by_short(ind.src_short_addr);
+
+            if (dev)
+            {
+                dev->online = true;
+                dev->last_seen_tick = xTaskGetTickCount();
+                dev->last_lqi = ind.lqi;
+                msg->cmd[CMD_LEN - 1] = '\0';
+
+                mesh_msg_t rx = {0};
+                strncpy(rx.source, dev->name, sizeof(rx.source) - 1);
+                strncpy(rx.cmd, msg->cmd, sizeof(rx.cmd) - 1);
+                rx.value = msg->value;
+
+                if (!enqueue_incoming_from_zigbee(rx))
+                {
+                    ESP_LOGW(TAG, "RX queue full, dropping message from %s", dev->name);
+                }
+
+                ESP_LOGI(TAG,
+                         "APS RX from %s LQI=%d: cmd='%s' value=%d",
+                         dev->name,
+                         ind.lqi,
+                         msg->cmd,
+                         msg->value);
+            }
+            else
+            {
+                ESP_LOGW(TAG,
+                         "APS RX from unknown short: 0x%04x",
+                         ind.src_short_addr);
+            }
+
+            return true;
+        }
+
+        // ===== CASE 2: plain string =====
+        size_t len = ind.asdu_length;
+        if (len > APS_MSG_MAX_LEN)
+        {
+            len = APS_MSG_MAX_LEN;
+        }
+
+        char msg[APS_MSG_MAX_LEN + 1] = {0};
+        memcpy(msg, ind.asdu, len);
+        msg[APS_MSG_MAX_LEN] = '\0';
+
+        DeviceEntry *dev = find_device_by_short(ind.src_short_addr);
+
+        mesh_msg_t rx = {0};
+        if (dev)
+        {
+            dev->online = true;
+            dev->last_seen_tick = xTaskGetTickCount();
+            dev->last_lqi = ind.lqi;
+
+            if (strncmp(msg, "PONG", 4) == 0)
+            {
+                int remote_lqi = -1;
+                char *p = strstr(msg, "LQI=");
+                if (p)
+                {
+                    remote_lqi = atoi(p + 4);
+                }
+                dev->remote_lqi = remote_lqi;
+                dev->fresh_ping_seen = true;
+            }
+
+            strncpy(rx.source, dev->name, sizeof(rx.source) - 1);
+            rx.value = dev->last_lqi;
+        }
+        else
+        {
+            rx.source[0] = '\0';
+            ESP_LOGW(TAG, "APS RX text from unknown short: 0x%04x", ind.src_short_addr);
+        }
+        strncpy(rx.text, msg, sizeof(rx.text) - 1);
+
+        if (!enqueue_incoming_from_zigbee(rx))
+        {
+            ESP_LOGW(TAG, "RX queue full, dropping text from %s", rx.source);
+        }
+
+        ESP_LOGI(TAG, "APS RX text from %s ep %d LQI=%d: %s",
+                 rx.source,
+                 ind.src_endpoint,
+                 ind.lqi,
+                 msg);
+
+        return true;
+    }
+
+    return false;
+}
+
+static void zb_buttons_handler(switch_func_pair_t *button_func_pair)
+{
+    if (button_func_pair->func == SWITCH_ONOFF_TOGGLE_CONTROL)
+    {
+        /* implemented light switch toggle functionality */
+        esp_zb_zcl_on_off_cmd_t cmd_req;
+        cmd_req.zcl_basic_cmd.src_endpoint = HA_ONOFF_SWITCH_ENDPOINT;
+        cmd_req.address_mode = ESP_ZB_APS_ADDR_MODE_DST_ADDR_ENDP_NOT_PRESENT;
+        cmd_req.on_off_cmd_id = ESP_ZB_ZCL_CMD_ON_OFF_TOGGLE_ID;
+        esp_zb_lock_acquire(portMAX_DELAY);
+        esp_zb_zcl_on_off_cmd_req(&cmd_req);
+        esp_zb_lock_release();
+        ESP_EARLY_LOGI(TAG, "Send 'on_off toggle' command");
+
+        if (g_last_light_short_addr != 0xFFFF && g_last_light_endpoint != 0xFF)
+        {
+            // ESP_LOGI(TAG, "Button: sending APS string to 0x%04x ep %d",
+            //        g_last_light_short_addr, g_last_light_endpoint);
+
+            ESP_LOGI(TAG, "Button: enqueueing blink commands");
+
+            mesh_msg_t msg = {0};
+
+            strncpy(msg.target, "Kitchen", sizeof(msg.target) - 1);
+            strncpy(msg.cmd, "blink", sizeof(msg.cmd) - 1);
+            msg.value = 3;
+            enqueue_outgoing(msg);
+
+            memset(&msg, 0, sizeof(msg));
+            strncpy(msg.target, "Garage", sizeof(msg.target) - 1);
+            strncpy(msg.cmd, "blink", sizeof(msg.cmd) - 1);
+            msg.value = 5;
+            enqueue_outgoing(msg);
+        }
+        else
+        {
+            ESP_LOGW(TAG, "Button: no known light endpoint yet");
+        }
+    }
+}
+
+static esp_err_t deferred_driver_init(void)
+{
+    ESP_RETURN_ON_FALSE(switch_driver_init(button_func_pair, PAIR_SIZE(button_func_pair), zb_buttons_handler), ESP_FAIL, TAG,
+                        "Failed to initialize switch driver");
+    return ESP_OK;
+}
+
+static void user_find_cb(esp_zb_zdp_status_t zdo_status, uint16_t addr, uint8_t endpoint, void *user_ctx);
+
+static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask)
+{
+    ESP_RETURN_ON_FALSE(esp_zb_bdb_start_top_level_commissioning(mode_mask) == ESP_OK, , TAG, "Failed to start Zigbee bdb commissioning");
+}
+
+#ifndef ZB_BROADCAST_RX_ON_WHEN_IDLE
+#define ZB_BROADCAST_RX_ON_WHEN_IDLE 0xFFFD
+#endif
+
+#define STARTUP_DISCOVERY_MAX_PASSES 3
+#define STARTUP_DISCOVERY_PASS_GAP_MS 5000
+#define STARTUP_DISCOVERY_QUERY_GAP_MS 500
+
+static void known_device_nwk_addr_cb(esp_zb_zdp_status_t zdo_status,
+                                     esp_zb_zdo_nwk_addr_rsp_t *resp,
+                                     void *user_ctx)
+{
+    DeviceEntry *dev = (DeviceEntry *)user_ctx;
+
+    if (!dev)
+    {
+        return;
+    }
+
+    if (zdo_status != ESP_ZB_ZDP_STATUS_SUCCESS || !resp)
+    {
+        ESP_LOGW(TAG, "Startup discovery: no NWK addr response for %s ieee=0x%016llx status=%d",
+                 dev->name,
+                 (unsigned long long)dev->ieee,
+                 zdo_status);
+        return;
+    }
+
+    uint64_t resp_ieee = ieee_array_to_u64(resp->ieee_addr);
+    if (resp_ieee != dev->ieee)
+    {
+        ESP_LOGW(TAG, "Startup discovery: response IEEE mismatch for %s expected=0x%016llx got=0x%016llx",
+                 dev->name,
+                 (unsigned long long)dev->ieee,
+                 (unsigned long long)resp_ieee);
+        return;
+    }
+
+    dev->short_addr = resp->nwk_addr;
+    dev->online = true;
+    dev->last_seen_tick = xTaskGetTickCount();
+
+    ESP_LOGI(TAG, "Startup discovery: %s ieee=0x%016llx short=0x%04x",
+             dev->name,
+             (unsigned long long)dev->ieee,
+             dev->short_addr);
+
+    // Now ask that node for an On/Off Light endpoint. user_find_cb() will update
+    // the endpoint and bind exactly like a normal device announcement path.
+    esp_zb_zdo_match_desc_req_param_t cmd_req = {0};
+    cmd_req.dst_nwk_addr = dev->short_addr;
+    cmd_req.addr_of_interest = dev->short_addr;
+    esp_zb_zdo_find_on_off_light(&cmd_req, user_find_cb, NULL);
+}
+
+static void discover_known_device_by_index(uint8_t index)
+{
+    if (index >= DEVICE_COUNT)
+    {
+        return;
+    }
+
+    DeviceEntry *dev = &devices[index];
+
+    // Skip placeholder/unassigned entries.
+    if (dev->ieee == 0 || dev->ieee == 0x00124B0001CCCCCCULL)
+    {
+        return;
+    }
+
+    esp_zb_zdo_nwk_addr_req_param_t req = {0};
+    req.dst_nwk_addr = ZB_BROADCAST_RX_ON_WHEN_IDLE;
+    u64_to_ieee_array(dev->ieee, req.ieee_addr_of_interest);
+    req.request_type = 0x00; // single device response
+    req.start_index = 0;
+
+    ESP_LOGI(TAG, "Startup discovery: querying %s ieee=0x%016llx",
+             dev->name,
+             (unsigned long long)dev->ieee);
+
+    esp_zb_zdo_nwk_addr_req(&req, known_device_nwk_addr_cb, dev);
+}
+
+static void discover_known_devices_alarm_cb(uint8_t packed_arg)
+{
+    uint8_t pass = (packed_arg >> 4) & 0x0F;
+    uint8_t index = packed_arg & 0x0F;
+
+    if (index >= DEVICE_COUNT)
+    {
+        return;
+    }
+
+    DeviceEntry *dev = &devices[index];
+
+    // On pass 1, query all known assigned devices.
+    // On later passes, retry only devices still offline/unresolved.
+    bool should_query = (pass == 1) || (!dev->online || dev->short_addr == 0xFFFF);
+
+    if (dev->ieee != 0 && dev->ieee != 0x00124B0001CCCCCCULL && should_query)
+    {
+        ESP_LOGI(TAG, "Startup discovery pass %u: retry/check %s", pass, dev->name);
+        discover_known_device_by_index(index);
+    }
+
+    uint8_t next = index + 1;
+    if (next < DEVICE_COUNT)
+    {
+        uint8_t next_arg = (uint8_t)((pass << 4) | (next & 0x0F));
+        esp_zb_scheduler_alarm((esp_zb_callback_t)discover_known_devices_alarm_cb,
+                               next_arg,
+                               STARTUP_DISCOVERY_QUERY_GAP_MS);
+    }
+}
+
+static void discover_known_devices_pass_alarm_cb(uint8_t pass)
+{
+    if (pass == 0 || pass > STARTUP_DISCOVERY_MAX_PASSES)
+    {
+        return;
+    }
+
+    ESP_LOGI(TAG, "Startup discovery: pass %u of %u",
+             pass,
+             STARTUP_DISCOVERY_MAX_PASSES);
+
+    uint8_t arg = (uint8_t)((pass << 4) | 0);
+    esp_zb_scheduler_alarm((esp_zb_callback_t)discover_known_devices_alarm_cb, arg, 0);
+
+    if (pass < STARTUP_DISCOVERY_MAX_PASSES)
+    {
+        esp_zb_scheduler_alarm((esp_zb_callback_t)discover_known_devices_pass_alarm_cb,
+                               pass + 1,
+                               STARTUP_DISCOVERY_PASS_GAP_MS);
+    }
+}
+
+static void discover_known_devices_start(void)
+{
+    ESP_LOGI(TAG, "Startup discovery: scanning known IEEE device table with %u passes",
+             STARTUP_DISCOVERY_MAX_PASSES);
+    esp_zb_scheduler_alarm((esp_zb_callback_t)discover_known_devices_pass_alarm_cb, 1, 1500);
+}
+
+static void bind_cb(esp_zb_zdp_status_t zdo_status, void *user_ctx)
+{
+    if (zdo_status == ESP_ZB_ZDP_STATUS_SUCCESS)
+    {
+        ESP_LOGI(TAG, "Bound successfully!");
+        if (user_ctx)
+        {
+            light_bulb_device_params_t *light = (light_bulb_device_params_t *)user_ctx;
+            ESP_LOGI(TAG, "The light originating from address(0x%x) on endpoint(%d)", light->short_addr, light->endpoint);
+            free(light);
+        }
+    }
+}
+
+static void user_find_cb(esp_zb_zdp_status_t zdo_status, uint16_t addr, uint8_t endpoint, void *user_ctx)
+{
+    if (zdo_status == ESP_ZB_ZDP_STATUS_SUCCESS)
+    {
+        ESP_LOGI(TAG, "Found light");
+        esp_zb_zdo_bind_req_param_t bind_req;
+        light_bulb_device_params_t *light = (light_bulb_device_params_t *)malloc(sizeof(light_bulb_device_params_t));
+        light->endpoint = endpoint;
+        light->short_addr = addr;
+        g_last_light_short_addr = addr;
+        g_last_light_endpoint = endpoint;
+        esp_zb_ieee_address_by_short(light->short_addr, light->ieee_addr);
+
+        update_device_table(light->ieee_addr, light->short_addr, light->endpoint);
+
+        esp_zb_get_long_address(bind_req.src_address);
+        bind_req.src_endp = HA_ONOFF_SWITCH_ENDPOINT;
+        bind_req.cluster_id = ESP_ZB_ZCL_CLUSTER_ID_ON_OFF;
+        bind_req.dst_addr_mode = ESP_ZB_ZDO_BIND_DST_ADDR_MODE_64_BIT_EXTENDED;
+        memcpy(bind_req.dst_address_u.addr_long, light->ieee_addr, sizeof(esp_zb_ieee_addr_t));
+        bind_req.dst_endp = endpoint;
+        bind_req.req_dst_addr = esp_zb_get_short_address();
+        ESP_LOGI(TAG, "Try to bind On/Off");
+        esp_zb_zdo_device_bind_req(&bind_req, bind_cb, (void *)light);
+    }
+}
+
+void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
+{
+    uint32_t *p_sg_p = signal_struct->p_app_signal;
+    esp_err_t err_status = signal_struct->esp_err_status;
+    esp_zb_app_signal_type_t sig_type = *p_sg_p;
+    esp_zb_zdo_signal_device_annce_params_t *dev_annce_params = NULL;
+    switch (sig_type)
+    {
+    case ESP_ZB_ZDO_SIGNAL_SKIP_STARTUP:
+        ESP_LOGI(TAG, "Initialize Zigbee stack");
+        esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_INITIALIZATION);
+        break;
+    case ESP_ZB_BDB_SIGNAL_DEVICE_FIRST_START:
+    case ESP_ZB_BDB_SIGNAL_DEVICE_REBOOT:
+        if (err_status == ESP_OK)
+        {
+            ESP_LOGI(TAG, "Deferred driver initialization %s", deferred_driver_init() ? "failed" : "successful");
+            ESP_LOGI(TAG, "Device started up in %s factory-reset mode", esp_zb_bdb_is_factory_new() ? "" : "non");
+            if (esp_zb_bdb_is_factory_new())
+            {
+                ESP_LOGI(TAG, "Start network formation");
+                esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_FORMATION);
+            }
+            else
+            {
+                esp_zb_bdb_open_network(180);
+                ESP_LOGI(TAG, "Device rebooted");
+                discover_known_devices_start();
+            }
+        }
+        else
+        {
+            ESP_LOGE(TAG, "Failed to initialize Zigbee stack (status: %s)", esp_err_to_name(err_status));
+        }
+        break;
+    case ESP_ZB_BDB_SIGNAL_FORMATION:
+        if (err_status == ESP_OK)
+        {
+            esp_zb_ieee_addr_t extended_pan_id;
+            esp_zb_get_extended_pan_id(extended_pan_id);
+            ESP_LOGI(TAG, "Formed network successfully (Extended PAN ID: %02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x, PAN ID: 0x%04hx, Channel:%d, Short Address: 0x%04hx)",
+                     extended_pan_id[7], extended_pan_id[6], extended_pan_id[5], extended_pan_id[4],
+                     extended_pan_id[3], extended_pan_id[2], extended_pan_id[1], extended_pan_id[0],
+                     esp_zb_get_pan_id(), esp_zb_get_current_channel(), esp_zb_get_short_address());
+            esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
+            discover_known_devices_start();
+        }
+        else
+        {
+            ESP_LOGI(TAG, "Restart network formation (status: %s)", esp_err_to_name(err_status));
+            esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_top_level_commissioning_cb, ESP_ZB_BDB_MODE_NETWORK_FORMATION, 1000);
+        }
+        break;
+    case ESP_ZB_BDB_SIGNAL_STEERING:
+        if (err_status == ESP_OK)
+        {
+            ESP_LOGI(TAG, "Network steering started");
+        }
+        break;
+    case ESP_ZB_ZDO_SIGNAL_DEVICE_ANNCE:
+        dev_annce_params = (esp_zb_zdo_signal_device_annce_params_t *)
+            esp_zb_app_signal_get_params(p_sg_p);
+
+        uint16_t short_addr = dev_annce_params->device_short_addr;
+
+        ESP_LOGI(TAG, "New device commissioned or rejoined (short: 0x%04hx)", short_addr);
+
+        // --- NEW CODE: get and print IEEE ---
+        esp_zb_ieee_addr_t ieee_addr;
+        if (esp_zb_ieee_address_by_short(short_addr, ieee_addr) == ESP_OK)
+        {
+            ESP_LOGI(TAG,
+                     "IEEE: %02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x",
+                     ieee_addr[7], ieee_addr[6], ieee_addr[5], ieee_addr[4],
+                     ieee_addr[3], ieee_addr[2], ieee_addr[1], ieee_addr[0]);
+            ESP_LOGI(TAG,
+                     "IEEE (C format): 0x%02x%02x%02x%02x%02x%02x%02x%02x",
+                     ieee_addr[7], ieee_addr[6], ieee_addr[5], ieee_addr[4],
+                     ieee_addr[3], ieee_addr[2], ieee_addr[1], ieee_addr[0]);
+        }
+        else
+        {
+            ESP_LOGW(TAG, "Failed to resolve IEEE for short 0x%04hx", short_addr);
+        }
+        // --- END NEW CODE ---
+
+        esp_zb_zdo_match_desc_req_param_t cmd_req;
+        cmd_req.dst_nwk_addr = short_addr;
+        cmd_req.addr_of_interest = short_addr;
+        esp_zb_zdo_find_on_off_light(&cmd_req, user_find_cb, NULL);
+        break;
+    case 0x3c: // ZDO Device Unavailable; SDK enum name varies between releases
+    {
+        uint16_t unavailable_short_addr = 0xFFFF;
+        void *params = esp_zb_app_signal_get_params(p_sg_p);
+        if (params)
+        {
+            unavailable_short_addr = *(uint16_t *)params;
+        }
+
+        DeviceEntry *dev = find_device_by_short(unavailable_short_addr);
+        if (dev)
+        {
+            dev->online = false;
+            ESP_LOGW(TAG, "Device marked OFFLINE: %s short=0x%04x", dev->name, unavailable_short_addr);
+        }
+        else
+        {
+            ESP_LOGW(TAG, "ZDO Device Unavailable for unknown short=0x%04x", unavailable_short_addr);
+        }
+        break;
+    }
+    case ESP_ZB_NWK_SIGNAL_PERMIT_JOIN_STATUS:
+        if (err_status == ESP_OK)
+        {
+            if (*(uint8_t *)esp_zb_app_signal_get_params(p_sg_p))
+            {
+                ESP_LOGI(TAG, "Network(0x%04hx) is open for %d seconds", esp_zb_get_pan_id(), *(uint8_t *)esp_zb_app_signal_get_params(p_sg_p));
+            }
+            else
+            {
+                ESP_LOGW(TAG, "Network(0x%04hx) closed, devices joining not allowed.", esp_zb_get_pan_id());
+            }
+        }
+        break;
+    default:
+        ESP_LOGI(TAG, "ZDO signal: %s (0x%x), status: %s", esp_zb_zdo_signal_to_string(sig_type), sig_type,
+                 esp_err_to_name(err_status));
+        break;
+    }
+}
+
+static void esp_zb_task(void *pvParameters)
+{
+    /* initialize Zigbee stack */
+    esp_zb_cfg_t zb_nwk_cfg = ESP_ZB_ZC_CONFIG();
+    esp_zb_init(&zb_nwk_cfg);
+    esp_zb_on_off_switch_cfg_t switch_cfg = ESP_ZB_DEFAULT_ON_OFF_SWITCH_CONFIG();
+    esp_zb_ep_list_t *esp_zb_on_off_switch_ep = esp_zb_on_off_switch_ep_create(HA_ONOFF_SWITCH_ENDPOINT, &switch_cfg);
+    zcl_basic_manufacturer_info_t info = {
+        .manufacturer_name = ESP_MANUFACTURER_NAME,
+        .model_identifier = ESP_MODEL_IDENTIFIER,
+    };
+
+    esp_zcl_utility_add_ep_basic_manufacturer_info(esp_zb_on_off_switch_ep, HA_ONOFF_SWITCH_ENDPOINT, &info);
+    esp_zb_device_register(esp_zb_on_off_switch_ep);
+
+    esp_zb_aps_data_confirm_handler_register(zb_apsde_data_confirm_handler);
+    esp_zb_aps_data_indication_handler_register(zb_apsde_data_indication_handler);
+
+    esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK);
+    ESP_ERROR_CHECK(esp_zb_start(false));
+    esp_zb_stack_main_loop();
+}
+
+void app_main(void)
+{
+    esp_zb_platform_config_t config = {
+        .radio_config = ESP_ZB_DEFAULT_RADIO_CONFIG(),
+        .host_config = ESP_ZB_DEFAULT_HOST_CONFIG(),
+    };
+
+    ESP_ERROR_CHECK(mesh_init_queues());
+    ESP_ERROR_CHECK(mesh_serial_init());
+
+    xTaskCreate(mesh_tx_task, "mesh_tx_task", 3072, NULL, 5, NULL);
+    xTaskCreate(app_msg_task, "app_msg_task", 3072, NULL, 5, NULL);
+    xTaskCreate(serial_console_task, "serial_console_task", 3072, NULL, 5, NULL);
+
+    ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_ERROR_CHECK(esp_zb_platform_config(&config));
+
+    xTaskCreate(esp_zb_task, "Zigbee_main", 4096, NULL, 5, NULL);
+}
