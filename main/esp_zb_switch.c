@@ -97,6 +97,31 @@ static void mesh_serial_writef(const char *fmt, ...)
 
 static const char *TAG = "COORDINATOR_ESPNOW";
 
+// Seeed Studio XIAO ESP32-C6 RF Switch Control
+// GPIO 3: RF switch enable (Active LOW - driving LOW powers ON the RF switch)
+// GPIO 14: Antenna select (LOW = Onboard ceramic antenna, HIGH = External U.FL)
+#define XIAO_RF_SWITCH_PWR_GPIO  GPIO_NUM_3
+#define XIAO_RF_SWITCH_SEL_GPIO  GPIO_NUM_14
+
+void mesh_coordinator_set_rf_pins(int pwr, int sel)
+{
+    gpio_reset_pin(XIAO_RF_SWITCH_PWR_GPIO);
+    gpio_set_direction(XIAO_RF_SWITCH_PWR_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(XIAO_RF_SWITCH_PWR_GPIO, pwr);
+
+    gpio_reset_pin(XIAO_RF_SWITCH_SEL_GPIO);
+    gpio_set_direction(XIAO_RF_SWITCH_SEL_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(XIAO_RF_SWITCH_SEL_GPIO, sel);
+
+    vTaskDelay(pdMS_TO_TICKS(20));
+    ESP_LOGI(TAG, "RF Switch set: PWR(GPIO3)=%d, SEL(GPIO14)=%d", pwr, sel);
+}
+
+static void xiao_rf_switch_init(void)
+{
+    mesh_coordinator_set_rf_pins(0, 0); // PWR=0 (ON), SEL=0 (Ceramic antenna)
+}
+
 #define ESPNOW_WIFI_CHANNEL 1
 #define MESH_TEXT_LEN 18
 #define MESH_LINE_LEN 80
@@ -555,8 +580,46 @@ static void serial_console_task(void *arg)
             mesh_serial_writef("\r\n> %s\r\n", line);
 
             if (strcmp(line, "help") == 0 || strcmp(line, "?") == 0) {
-                mesh_serial_write("\r\nCommands: GiveNetworkReport, PingNetwork, ResetNetwork, ResetCoordinator\r\n");
+                mesh_serial_write("\r\nCommands: GiveNetworkReport, PingNetwork, ResetNetwork, ResetCoordinator, scan, rf <pwr> <sel>\r\n");
                 mesh_serial_write("Usage: <DeviceName> <command/text> (e.g. Kitchen blink 3)\r\ncoordinator> ");
+                pos = 0;
+                memset(line, 0, sizeof(line));
+                continue;
+            }
+
+            if (strncmp(line, "rf ", 3) == 0) {
+                int pwr = 0, sel = 0;
+                if (sscanf(line + 3, "%d %d", &pwr, &sel) == 2) {
+                    mesh_coordinator_set_rf_pins(pwr, sel);
+                    mesh_serial_writef("RF pins set: PWR=%d, SEL=%d\r\n", pwr, sel);
+                }
+                pos = 0;
+                memset(line, 0, sizeof(line));
+                continue;
+            }
+
+            if (strcmp(line, "scan") == 0) {
+                mesh_serial_write("Scanning Wi-Fi...\r\n");
+                wifi_scan_config_t scan_cfg = {0};
+                esp_err_t err = esp_wifi_scan_start(&scan_cfg, true);
+                if (err == ESP_OK) {
+                    uint16_t ap_count = 0;
+                    esp_wifi_scan_get_ap_num(&ap_count);
+                    mesh_serial_writef("Found %d APs\r\n", ap_count);
+                    if (ap_count > 0) {
+                        wifi_ap_record_t *ap_list = malloc(sizeof(wifi_ap_record_t) * ap_count);
+                        if (ap_list) {
+                            esp_wifi_scan_get_ap_records(&ap_count, ap_list);
+                            for (int i = 0; i < ap_count && i < 10; i++) {
+                                mesh_serial_writef("  SSID: %s, RSSI: %d, Chan: %d\r\n",
+                                                   ap_list[i].ssid, ap_list[i].rssi, ap_list[i].primary);
+                            }
+                            free(ap_list);
+                        }
+                    }
+                } else {
+                    mesh_serial_writef("Scan failed: %s\r\n", esp_err_to_name(err));
+                }
                 pos = 0;
                 memset(line, 0, sizeof(line));
                 continue;
@@ -739,6 +802,9 @@ void app_main(void)
         ESP_ERROR_CHECK(evt_err);
     }
 
+    // Power on Seeed Studio XIAO ESP32-C6 RF switch and select ceramic antenna
+    xiao_rf_switch_init();
+
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
@@ -747,6 +813,9 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_wifi_set_channel(ESPNOW_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE));
     ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N));
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+
+    // Re-assert RF switch after Wi-Fi start
+    xiao_rf_switch_init();
 
     ESP_ERROR_CHECK(esp_now_init());
     ESP_ERROR_CHECK(esp_now_register_recv_cb(espnow_recv_cb));
