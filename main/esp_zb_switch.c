@@ -207,6 +207,14 @@ static bool ensure_peer_exists(const uint8_t *mac)
         ESP_LOGE(TAG, "Failed to add peer: %s", esp_err_to_name(err));
         return false;
     }
+
+    esp_now_rate_config_t rate_cfg = {
+        .phymode = WIFI_PHY_MODE_LR,
+        .rate = WIFI_PHY_RATE_LORA_250K,
+        .ersu = false,
+        .dcm = false,
+    };
+    esp_now_set_peer_rate_config(mac, &rate_cfg);
     return true;
 }
 
@@ -811,11 +819,17 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_set_channel(ESPNOW_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE));
-    ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N));
+    ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR));
+    ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(80)); // 80 * 0.25 dBm = 20 dBm (Maximum RF TX Power)
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
     // Re-assert RF switch after Wi-Fi start
     xiao_rf_switch_init();
+
+    int8_t max_tx_power = 0;
+    esp_wifi_get_max_tx_power(&max_tx_power);
+    ESP_LOGI(TAG, "Coordinator Wi-Fi Config: Max TX Power=%d (0.25dBm units, %.2fdBm), LR Mode enabled",
+             max_tx_power, max_tx_power * 0.25f);
 
     ESP_ERROR_CHECK(esp_now_init());
     ESP_ERROR_CHECK(esp_now_register_recv_cb(espnow_recv_cb));
